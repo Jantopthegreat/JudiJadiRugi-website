@@ -25,12 +25,12 @@ MODEL_PATH = os.getenv("MODEL_PATH", "models/judi_clf.joblib")
 VECTORIZER_PATH = os.getenv("VECTORIZER_PATH", "models/judi_vectorizer.joblib")
 THRESHOLD = float(os.getenv("THRESHOLD", "0.8"))
 THRESHOLD_LOW = float(os.getenv("THRESHOLD_LOW", "0.5"))   # batas bawah berpotensi
-JWT_SECRET = os.getenv("JWT_SECRET", "ganti-dengan-secret-yang-kuat")
+JWT_SECRET = os.getenv("SECRET_KEY")
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
 
 # Admin credentials dari .env (tidak disimpan di DB untuk simplisitas)
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@judidetektor.com")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # ganti di .env!
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")  
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL belum di-set. Cek file .env")
@@ -407,11 +407,13 @@ def submit_feedback(req: FeedbackRequest):
 # ==============================================================================
 # ADMIN ENDPOINTS
 # ==============================================================================
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
 @app.post("/admin/login")
 def admin_login(req: AdminLoginRequest):
     """Login admin, return JWT token"""
-    if req.email != ADMIN_EMAIL or req.password != ADMIN_PASSWORD:
+    if req.email != ADMIN_EMAIL or not verify_password(req.password, ADMIN_PASSWORD_HASH):
         raise HTTPException(status_code=401, detail="Email atau password salah")
 
     token = create_token(req.email)
@@ -421,13 +423,13 @@ def admin_login(req: AdminLoginRequest):
         "expires_in": f"{JWT_EXPIRE_HOURS} jam"
     }
 
-
+ 
 @app.get("/admin/me")
 def admin_me(payload: dict = Depends(verify_token)):
     """Cek info admin yang sedang login"""
     return {"email": payload.get("sub"), "role": payload.get("role")}
-
-
+ 
+ 
 @app.get("/admin/feedback/pending")
 def list_pending_feedback(payload: dict = Depends(verify_token)):
     """
@@ -462,13 +464,13 @@ def list_pending_feedback(payload: dict = Depends(verify_token)):
             ORDER BY is_mismatch DESC, fq.proba_judi DESC
             LIMIT 100
         """)).mappings().all()
-
+ 
     return {
         "total": len(rows),
         "data": list(rows)
     }
-
-
+ 
+ 
 @app.get("/admin/feedback/stats")
 def feedback_stats(payload: dict = Depends(verify_token)):
     """Statistik feedback untuk dashboard admin"""
@@ -482,7 +484,7 @@ def feedback_stats(payload: dict = Depends(verify_token)):
                 SUM(CASE WHEN pred_label != suggested_label THEN 1 ELSE 0 END) as total_mismatch
             FROM feedback_queue
         """)).mappings().first()
-
+ 
         dataset_count = conn.execute(text("""
             SELECT
                 COUNT(*) as total,
@@ -490,13 +492,13 @@ def feedback_stats(payload: dict = Depends(verify_token)):
                 SUM(CASE WHEN label_manual=0 THEN 1 ELSE 0 END) as total_bukan_judi
             FROM feedback_dataset
         """)).mappings().first()
-
+ 
     return {
         "feedback_queue": dict(stats),
         "feedback_dataset": dict(dataset_count)
     }
-
-
+ 
+ 
 @app.put("/admin/feedback/{feedback_id}/review")
 def review_feedback(
     feedback_id: int,
@@ -511,13 +513,13 @@ def review_feedback(
         row = conn.execute(text("""
             SELECT * FROM feedback_queue WHERE id=:id
         """), {"id": feedback_id}).mappings().first()
-
+ 
         if not row:
             raise HTTPException(status_code=404, detail="Feedback tidak ditemukan")
-
+ 
         if row["status"] != "pending":
             raise HTTPException(status_code=409, detail=f"Feedback sudah di-{row['status']}")
-
+ 
         # Update status di feedback_queue
         conn.execute(text("""
             UPDATE feedback_queue
@@ -525,11 +527,11 @@ def review_feedback(
             WHERE id=:id
         """), {"status": req.action + "d", "id": feedback_id})
         # "approve" → "approved", "reject" → "rejected"
-
+ 
         # Kalau approve → masuk feedback_dataset
         if req.action == "approve":
             is_mismatch = 1 if row["pred_label"] != row["suggested_label"] else 0
-
+ 
             conn.execute(text("""
                 INSERT INTO feedback_dataset
                     (comment_text, comment_clean, label_manual, source,
@@ -546,21 +548,23 @@ def review_feedback(
                 "pred_label": row["pred_label"],
                 "is_mismatch": is_mismatch,
             })
-
+ 
     return {
         "id": feedback_id,
         "action": req.action,
         "masuk_dataset": req.action == "approve",
         "reviewed_at": datetime.utcnow().isoformat()
     }
-
-
+ 
+ 
 @app.get("/admin/feedback/export")
 def export_feedback_dataset(payload: dict = Depends(verify_token)):
     """Export feedback_dataset untuk keperluan re-training model"""
     with engine.begin() as conn:
         rows = conn.execute(text("""
             SELECT
+                id,
+                comment_text,
                 comment_clean,
                 label_manual,
                 source,
@@ -571,15 +575,15 @@ def export_feedback_dataset(payload: dict = Depends(verify_token)):
             FROM feedback_dataset
             ORDER BY created_at DESC
         """)).mappings().all()
-
+ 
     return {
         "total": len(rows),
         "total_judi": sum(1 for r in rows if r["label_manual"] == 1),
         "total_bukan_judi": sum(1 for r in rows if r["label_manual"] == 0),
         "data": list(rows)
     }
-
-
+ 
+ 
 @app.get("/admin/scans")
 def admin_list_scans(payload: dict = Depends(verify_token)):
     """Admin: lihat semua riwayat scan"""
@@ -592,21 +596,21 @@ def admin_list_scans(payload: dict = Depends(verify_token)):
             LIMIT 100
         """)).mappings().all()
     return list(rows)
-
-
+ 
+ 
 @app.get("/admin/overview")
 def admin_overview(payload: dict = Depends(verify_token)):
     """Admin: statistik overview untuk dashboard"""
     with engine.begin() as conn:
         # Total scan
         total_scans = conn.execute(text("SELECT COUNT(*) as c FROM scans")).mappings().first()["c"]
-
+ 
         # Total komentar diproses
         total_comments = conn.execute(text("SELECT SUM(total_comments) as c FROM scans")).mappings().first()["c"] or 0
-
+ 
         # Total terindikasi
         total_flagged = conn.execute(text("SELECT SUM(flagged_count) as c FROM scans")).mappings().first()["c"] or 0
-
+ 
         # Scan 7 hari terakhir (per hari)
         daily = conn.execute(text("""
             SELECT
@@ -619,7 +623,7 @@ def admin_overview(payload: dict = Depends(verify_token)):
             GROUP BY DATE(created_at)
             ORDER BY tanggal ASC
         """)).mappings().all()
-
+ 
         # Top 5 video paling banyak discan
         top_videos = conn.execute(text("""
             SELECT video_title, channel_name, video_id,
@@ -631,7 +635,22 @@ def admin_overview(payload: dict = Depends(verify_token)):
             ORDER BY scan_count DESC
             LIMIT 5
         """)).mappings().all()
-
+ 
+        # Top 5 channel paling banyak ditemukan komentar judi
+        top_channels = conn.execute(text("""
+            SELECT
+                s.channel_name,
+                COUNT(sr.id) as total_flagged,
+                COUNT(DISTINCT s.id) as total_scan
+            FROM scan_results sr
+            JOIN scans s ON s.id = sr.scan_id
+            WHERE sr.pred_label = 1
+            AND s.channel_name IS NOT NULL
+            GROUP BY s.channel_name
+            ORDER BY total_flagged DESC
+            LIMIT 5
+        """)).mappings().all()
+ 
         # Scan terbaru
         recent = conn.execute(text("""
             SELECT id, video_title, channel_name,
@@ -640,7 +659,7 @@ def admin_overview(payload: dict = Depends(verify_token)):
             ORDER BY created_at DESC
             LIMIT 5
         """)).mappings().all()
-
+ 
     return {
         "total_scans": total_scans,
         "total_comments": int(total_comments),
@@ -648,5 +667,97 @@ def admin_overview(payload: dict = Depends(verify_token)):
         "flagged_rate": round((int(total_flagged) / int(total_comments) * 100), 2) if total_comments else 0,
         "daily": list(daily),
         "top_videos": list(top_videos),
+        "top_channels": list(top_channels),
         "recent_scans": list(recent),
+    }
+
+# ==============================================================================
+# DELETE ENDPOINTS
+# ==============================================================================
+ 
+@app.delete("/admin/scans/{scan_id}")
+def delete_scan(scan_id: int, payload: dict = Depends(verify_token)):
+    """
+    Admin: hapus riwayat scan beserta semua scan_results-nya.
+    Cascade delete akan otomatis hapus scan_results karena ada FK ON DELETE CASCADE.
+    """
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT id, video_title FROM scans WHERE id=:id"), {"id": scan_id}
+        ).mappings().first()
+ 
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan tidak ditemukan")
+ 
+        conn.execute(text("DELETE FROM scans WHERE id=:id"), {"id": scan_id})
+ 
+    return {
+        "message": f"Scan #{scan_id} berhasil dihapus",
+        "deleted_scan_id": scan_id,
+        "video_title": row["video_title"],
+    }
+ 
+ 
+@app.delete("/admin/feedback/{feedback_id}")
+def delete_feedback(feedback_id: int, payload: dict = Depends(verify_token)):
+    """
+    Admin: hapus feedback dari queue.
+    Hanya bisa hapus yang masih pending atau rejected.
+    Yang sudah approved tidak bisa dihapus langsung (harus hapus dari dataset).
+    """
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT id, status FROM feedback_queue WHERE id=:id"), {"id": feedback_id}
+        ).mappings().first()
+ 
+        if not row:
+            raise HTTPException(status_code=404, detail="Feedback tidak ditemukan")
+ 
+        if row["status"] == "approved":
+            raise HTTPException(
+                status_code=400,
+                detail="Feedback yang sudah approved tidak bisa dihapus langsung. Hapus dari feedback_dataset."
+            )
+ 
+        conn.execute(text("DELETE FROM feedback_queue WHERE id=:id"), {"id": feedback_id})
+ 
+    return {
+        "message": f"Feedback #{feedback_id} berhasil dihapus",
+        "deleted_feedback_id": feedback_id,
+    }
+ 
+ 
+@app.delete("/admin/dataset/{dataset_id}")
+def delete_dataset_entry(dataset_id: int, payload: dict = Depends(verify_token)):
+    """Admin: hapus satu entri dari feedback_dataset"""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT id, label_manual FROM feedback_dataset WHERE id=:id"), {"id": dataset_id}
+        ).mappings().first()
+ 
+        if not row:
+            raise HTTPException(status_code=404, detail="Entri dataset tidak ditemukan")
+ 
+        conn.execute(text("DELETE FROM feedback_dataset WHERE id=:id"), {"id": dataset_id})
+ 
+    return {
+        "message": f"Entri dataset #{dataset_id} berhasil dihapus",
+        "deleted_id": dataset_id,
+        "label_was": row["label_manual"],
+    }
+ 
+ 
+@app.delete("/admin/dataset")
+def delete_all_dataset(payload: dict = Depends(verify_token)):
+    """
+    Admin: hapus SEMUA entri feedback_dataset.
+    Gunakan dengan hati-hati! Untuk reset dataset.
+    """
+    with engine.begin() as conn:
+        count = conn.execute(text("SELECT COUNT(*) as c FROM feedback_dataset")).mappings().first()["c"]
+        conn.execute(text("DELETE FROM feedback_dataset"))
+ 
+    return {
+        "message": f"Semua entri feedback_dataset berhasil dihapus",
+        "total_deleted": count,
     }
